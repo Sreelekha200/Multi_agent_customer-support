@@ -152,12 +152,12 @@ Eval set: 30–50 hand-written sample tickets with expected category + expected 
 
 ### Phase 3: Scoped business tools
 
-- [ ] Implement read-only customer context, invoice, subscription, charge, order, refund eligibility, known-issue, and system-status tools.
-- [ ] Implement the sandboxed diagnostic tool with strict input validation, timeouts, resource limits, and redacted output.
-- [ ] Implement low-risk `create_bug_ticket` with validation, idempotency, and audit logging.
-- [ ] Implement `issue_refund` as a policy-aware operation that cannot bypass approval or rate-limit checks.
-- [ ] Implement identity verification, password-reset initiation, and account-review flagging.
-- [ ] Add explicit tool allowlists for each specialist agent and tests proving unauthorized tools are rejected.
+- [x] Implement read-only customer context, invoice, subscription, charge, order, refund eligibility, known-issue, and system-status tools.
+- [x] Implement the initial diagnostic tool with strict input validation and safe, bounded checks; native sandbox execution remains for the SDK integration phase.
+- [x] Implement low-risk `create_bug_ticket` with validation, idempotency, and audit logging.
+- [x] Implement `issue_refund` as a policy-aware operation that cannot bypass approval or rate-limit checks.
+- [x] Implement identity verification, password-reset initiation, and account-review flagging.
+- [x] Add explicit tool allowlists for each specialist agent and tests proving unauthorized tools are rejected.
 - [ ] Add failure behavior for unavailable services, invalid IDs, timeouts, malformed results, and partial writes.
 
 ### Phase 4: Agent orchestration

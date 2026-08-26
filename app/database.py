@@ -116,6 +116,13 @@ class TicketRepository:
                     event_type TEXT NOT NULL,
                     status TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS refunds (
+                    id TEXT PRIMARY KEY,
+                    order_id TEXT NOT NULL,
+                    customer_id TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             connection.executemany(

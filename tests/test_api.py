@@ -3,6 +3,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from app.main import app, ticket_repository
+from app.tools import ApprovalRequired, NotFoundError, ToolError, ToolPermissionError, ToolRegistry
 
 client = TestClient(app)
 INGESTION_HEADERS = {"X-Ingestion-Key": "dev-ingestion-key"}
@@ -96,3 +97,56 @@ def test_ticket_ingestion_rejects_malformed_payload() -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_scoped_tools_read_seeded_customer_data() -> None:
+    registry = ToolRegistry(ticket_repository)
+
+    context = registry.call("triage", "get_customer_context", customer_id="customer-123")
+    order = registry.call("refunds", "get_order", order_id="order-100")
+
+    assert context["plan"] == "pro"
+    assert order["amount"] == 29.0
+
+
+def test_tool_allowlist_rejects_cross_agent_access() -> None:
+    registry = ToolRegistry(ticket_repository)
+
+    try:
+        registry.call("billing", "issue_refund", order_id="order-100", amount=10)
+    except ToolPermissionError:
+        pass
+    else:
+        raise AssertionError("billing agent must not access refund tools")
+
+
+def test_refund_threshold_requires_approval_and_safe_refund_is_recorded() -> None:
+    registry = ToolRegistry(ticket_repository)
+
+    try:
+        registry.call("refunds", "issue_refund", order_id="order-101", amount=79)
+    except ApprovalRequired:
+        pass
+    else:
+        raise AssertionError("above-threshold refund must require approval")
+
+    result = registry.call("refunds", "issue_refund", order_id="order-100", amount=10)
+    assert result["status"] == "issued"
+
+
+def test_tools_return_safe_failures_for_unknown_records_and_diagnostics() -> None:
+    registry = ToolRegistry(ticket_repository)
+
+    try:
+        registry.call("billing", "get_invoice", invoice_id="missing")
+    except NotFoundError:
+        pass
+    else:
+        raise AssertionError("missing records must fail safely")
+
+    try:
+        registry.call("technical", "run_diagnostic", account_id="customer-123", check="shell")
+    except ToolError as error:
+        assert str(error) == "Unsupported diagnostic check"
+    else:
+        raise AssertionError("unsupported diagnostics must be rejected")
