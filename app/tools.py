@@ -27,6 +27,10 @@ class ApprovalRequired(ToolError):
     pass
 
 
+class ToolUnavailable(ToolError):
+    pass
+
+
 class DiagnosticRequest(BaseModel):
     account_id: str = Field(min_length=1, max_length=128)
     check: str = Field(min_length=1, max_length=64)
@@ -71,6 +75,10 @@ class ToolRegistry:
             raise ToolPermissionError(f"{tool_name} is not allowed for {agent_name}")
         try:
             return self.tools[tool_name](**arguments)
+        except (sqlite3.Error, TimeoutError) as error:
+            raise ToolUnavailable(f"Tool service unavailable: {tool_name}") from error
+        except ValueError as error:
+            raise ToolError(f"Invalid arguments for tool: {tool_name}") from error
         except KeyError as error:
             raise ToolError(f"Unknown tool: {tool_name}") from error
 
@@ -147,6 +155,8 @@ class ToolRegistry:
     def issue_refund(self, order_id: str, amount: float) -> dict[str, Any]:
         request = RefundRequest(order_id=order_id, amount=amount)
         order = self.get_order(request.order_id)
+        if order["status"] != "paid":
+            raise ToolError("Only paid orders can be refunded")
         if request.amount > float(order["amount"]):
             raise ToolError("Refund amount exceeds order amount")
         if request.amount > self.settings.refund_approval_threshold:

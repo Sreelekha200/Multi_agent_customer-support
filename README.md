@@ -17,4 +17,5 @@ Start the API with:
 uvicorn app.main:app --reload
 ```
 
-The initial vertical slice exposes `GET /health` and `POST /tickets`.
+The API exposes `GET /health`, `POST /tickets`, and `POST /tickets/{ticket_id}/process`.
+Processing performs deterministic triage, routes to a scoped specialist, persists agent runs and tool calls, and escalates low-confidence or failed work.

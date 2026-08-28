@@ -3,6 +3,8 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from app.main import app, ticket_repository
+from app.orchestration import AgentOrchestrator
+from app.schemas import Ticket, TicketCategory, TriageResult
 from app.tools import ApprovalRequired, NotFoundError, ToolError, ToolPermissionError, ToolRegistry
 
 client = TestClient(app)
@@ -150,3 +152,37 @@ def test_tools_return_safe_failures_for_unknown_records_and_diagnostics() -> Non
         assert str(error) == "Unsupported diagnostic check"
     else:
         raise AssertionError("unsupported diagnostics must be rejected")
+
+
+def test_orchestrator_routes_billing_and_records_tool_call() -> None:
+    ticket = ticket_repository.save_ticket(
+        Ticket(customer_id="customer-123", channel="chat", subject="Plan question", body="What plan am I on?")
+    )
+
+    result = AgentOrchestrator(ticket_repository).process(ticket.id)
+
+    assert result["status"] == "resolved"
+    assert result["agent"] == "billing"
+    with ticket_repository._connect() as connection:
+        run = connection.execute(
+            "SELECT agent_name FROM agent_runs WHERE ticket_id = ? ORDER BY rowid DESC LIMIT 1", (str(ticket.id),)
+        ).fetchone()
+        calls = connection.execute(
+            "SELECT name FROM tool_calls WHERE agent_run_id = (SELECT id FROM agent_runs WHERE ticket_id = ? AND agent_name = 'billing' ORDER BY rowid DESC LIMIT 1)",
+            (str(ticket.id),),
+        ).fetchall()
+    assert run["agent_name"] == "billing"
+    assert [call["name"] for call in calls] == ["get_subscription"]
+
+
+def test_orchestrator_escalates_low_confidence_without_specialist() -> None:
+    ticket = ticket_repository.save_ticket(
+        Ticket(customer_id="customer-123", channel="email", subject="Hello", body="I have a question")
+    )
+    triage = lambda _ticket, _context: TriageResult(category=TicketCategory.BILLING, urgency=1,
+                                                    sentiment="neutral", confidence=0.2, summary="ambiguous")
+
+    result = AgentOrchestrator(ticket_repository, triage=triage).process(ticket.id)
+
+    assert result["status"] == "escalated"
+    assert "confidence" in result["reason"]

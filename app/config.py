@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     refund_approval_threshold: float = Field(default=50.0, ge=0.0)
     max_tool_calls: int = Field(default=12, ge=1)
     max_agent_turns: int = Field(default=8, ge=1)
+    max_execution_seconds: float = Field(default=10.0, gt=0)
+    max_tool_retries: int = Field(default=1, ge=0)
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 

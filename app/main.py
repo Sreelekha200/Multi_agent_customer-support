@@ -2,11 +2,13 @@ from fastapi import FastAPI, Header, HTTPException, Response, status
 
 from .config import get_settings
 from .database import TicketRepository
+from .orchestration import AgentOrchestrator, OrchestrationError
 from .schemas import Ticket, TicketCreate
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name, version="0.1.0")
 ticket_repository = TicketRepository(settings.database_url)
+orchestrator = AgentOrchestrator(ticket_repository, settings)
 
 
 @app.get("/health")
@@ -31,3 +33,12 @@ def create_ticket(
 
     normalized_ticket = Ticket.model_validate(ticket.model_dump())
     return ticket_repository.save_ticket(normalized_ticket)
+
+
+@app.post("/tickets/{ticket_id}/process")
+def process_ticket(ticket_id: str) -> dict[str, object]:
+    try:
+        from uuid import UUID
+        return orchestrator.process(UUID(ticket_id))
+    except (ValueError, OrchestrationError) as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
