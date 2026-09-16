@@ -2,9 +2,10 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from app.guardrails import redact_pii, validate_response_policy
 from app.main import app, ticket_repository
 from app.orchestration import AgentOrchestrator
-from app.schemas import Ticket, TicketCategory, TriageResult
+from app.schemas import ApprovalStatus, Ticket, TicketCategory, TriageResult
 from app.tools import ApprovalRequired, NotFoundError, ToolError, ToolPermissionError, ToolRegistry
 
 client = TestClient(app)
@@ -186,3 +187,55 @@ def test_orchestrator_escalates_low_confidence_without_specialist() -> None:
 
     assert result["status"] == "escalated"
     assert "confidence" in result["reason"]
+
+
+def test_guardrails_redact_pii_and_block_unsafe_response_language() -> None:
+    redacted, flags = redact_pii("Email jane.smith@example.com or call 555-123-4567")
+
+    assert "jane.smith@example.com" not in redacted
+    assert "555-123-4567" not in redacted
+    assert flags
+
+    violations = validate_response_policy("I can guarantee a full refund and give legal advice")
+    assert violations
+
+
+def test_account_actions_are_hard_denied_and_rate_limited() -> None:
+    registry = ToolRegistry(ticket_repository)
+
+    try:
+        registry.call("account-security", "disable_2fa", customer_id="customer-123")
+    except ToolPermissionError as error:
+        assert "Human review required" in str(error)
+    else:
+        raise AssertionError("dangerous account actions must be blocked")
+
+    assert registry.check_rate_limit("customer-123", "refund") == False
+
+    registry.record_rate_limit_event("customer-123", "refund")
+    registry.record_rate_limit_event("customer-123", "refund")
+    registry.record_rate_limit_event("customer-123", "refund")
+    assert registry.check_rate_limit("customer-123", "refund") == True
+
+
+def test_approval_requests_support_review_and_expiration() -> None:
+    registry = ToolRegistry(ticket_repository)
+    approval = registry.create_approval_request(
+        "customer-123",
+        "11111111-1111-4111-8111-111111111111",
+        "issue_refund",
+        "Large refund requires review"
+    )
+
+    assert approval.status == ApprovalStatus.PENDING
+    registry.approve_approval_request(approval.id, "reviewer-1")
+    assert registry.get_approval_request(approval.id).status == ApprovalStatus.APPROVED
+
+    expired = registry.create_approval_request(
+        "customer-123",
+        "11111111-1111-4111-8111-111111111112",
+        "change_email",
+        "Sensitive customer change"
+    )
+    expired.created_at = expired.created_at.replace(year=expired.created_at.year - 1)
+    assert registry.is_approval_expired(expired) is True

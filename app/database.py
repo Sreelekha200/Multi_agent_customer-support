@@ -56,6 +56,12 @@ class TicketRepository:
                     reason TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS rate_limit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    customer_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS agent_runs (
                     id TEXT PRIMARY KEY,
                     ticket_id TEXT NOT NULL,
@@ -77,10 +83,14 @@ class TicketRepository:
                 CREATE TABLE IF NOT EXISTS approval_requests (
                     id TEXT PRIMARY KEY,
                     agent_run_id TEXT NOT NULL,
+                    customer_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
                     proposed_action TEXT NOT NULL,
                     risk_reason TEXT NOT NULL,
                     status TEXT NOT NULL,
                     reviewer_id TEXT,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
                     schema_version INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS customers (
@@ -150,6 +160,25 @@ class TicketRepository:
                 ("security-100", "customer-123", "new-login", "reviewed"),
             )
 
+            approval_columns = {row["name"] for row in connection.execute("PRAGMA table_info('approval_requests')").fetchall()}
+            for column_name, column_type in {
+                "customer_id": "TEXT",
+                "action": "TEXT",
+                "created_at": "TEXT",
+                "expires_at": "TEXT",
+            }.items():
+                if column_name not in approval_columns:
+                    connection.execute(f"ALTER TABLE approval_requests ADD COLUMN {column_name} {column_type}")
+
+            rate_columns = {row["name"] for row in connection.execute("PRAGMA table_info('rate_limit_events')").fetchall()}
+            for column_name, column_type in {
+                "customer_id": "TEXT",
+                "action": "TEXT",
+                "created_at": "TEXT",
+            }.items():
+                if column_name not in rate_columns:
+                    connection.execute(f"ALTER TABLE rate_limit_events ADD COLUMN {column_name} {column_type}")
+
     def save_ticket(self, ticket: Ticket) -> Ticket:
         with self._connect() as connection:
             connection.execute(
@@ -215,16 +244,41 @@ class TicketRepository:
             )
         return run
 
+    def record_guardrail_event(self, ticket_id: UUID, guardrail_name: str, decision: str, reason: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO guardrail_events (ticket_id, guardrail_name, decision, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+                (str(ticket_id), guardrail_name, decision, reason, datetime.now(UTC).isoformat()),
+            )
+
     def save_approval_request(self, request: ApprovalRequest) -> ApprovalRequest:
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO approval_requests
-                (id, agent_run_id, proposed_action, risk_reason, status, reviewer_id, schema_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(request.id), str(request.agent_run_id), request.proposed_action,
-                 request.risk_reason, request.status.value, request.reviewer_id, request.schema_version),
+                (id, agent_run_id, customer_id, action, proposed_action, risk_reason, status, reviewer_id, created_at, expires_at, schema_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(request.id), str(request.agent_run_id), request.customer_id, request.action,
+                 request.proposed_action, request.risk_reason, request.status.value, request.reviewer_id,
+                 request.created_at.isoformat(), request.expires_at.isoformat(), request.schema_version),
             )
+        ticket_row = connection.execute("SELECT ticket_id FROM agent_runs WHERE id = ?", (str(request.agent_run_id),)).fetchone()
+        if ticket_row:
+            self.record_audit_event(UUID(ticket_row["ticket_id"]), "approval_requested", {
+                "approval_id": str(request.id),
+                "action": request.action,
+                "status": request.status.value,
+                "risk_reason": request.risk_reason,
+            })
         return request
+
+    def get_approval_request(self, request_id: UUID) -> ApprovalRequest | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM approval_requests WHERE id = ?", (str(request_id),)
+            ).fetchone()
+        if not row:
+            return None
+        return ApprovalRequest.model_validate({**dict(row), "id": row["id"], "agent_run_id": row["agent_run_id"]})
 
     def update_approval_request(
         self, request_id: UUID, status: ApprovalStatus, reviewer_id: str
@@ -234,6 +288,16 @@ class TicketRepository:
                 "UPDATE approval_requests SET status = ?, reviewer_id = ? WHERE id = ?",
                 (status.value, reviewer_id, str(request_id)),
             )
+        if result.rowcount == 1:
+            request = self.get_approval_request(request_id)
+            if request:
+                ticket_row = connection.execute("SELECT ticket_id FROM agent_runs WHERE id = ?", (str(request.agent_run_id),)).fetchone()
+                if ticket_row:
+                    self.record_audit_event(UUID(ticket_row["ticket_id"]), "approval_updated", {
+                        "approval_id": str(request_id),
+                        "status": status.value,
+                        "reviewer_id": reviewer_id,
+                    })
         return result.rowcount == 1
 
     def record_audit_event(self, ticket_id: UUID, event_type: str, details: dict[str, object]) -> None:
@@ -247,5 +311,19 @@ class TicketRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM audit_events WHERE ticket_id = ? ORDER BY id", (str(ticket_id),)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_rate_limit_event(self, customer_id: str, action: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO rate_limit_events (customer_id, action, created_at) VALUES (?, ?, ?)",
+                (customer_id, action, datetime.now(UTC).isoformat()),
+            )
+
+    def get_guardrail_events(self, ticket_id: UUID) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM guardrail_events WHERE ticket_id = ? ORDER BY id", (str(ticket_id),)
             ).fetchall()
         return [dict(row) for row in rows]

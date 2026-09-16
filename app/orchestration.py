@@ -6,6 +6,7 @@ from uuid import UUID
 
 from .config import Settings, get_settings
 from .database import TicketRepository
+from .guardrails import redact_pii, validate_response_policy
 from .schemas import (
     AgentRun,
     ResponseDraft,
@@ -15,7 +16,7 @@ from .schemas import (
     ToolCall,
     TriageResult,
 )
-from .tools import ToolError, ToolRegistry
+from .tools import ApprovalRequired, ToolError, ToolRegistry
 
 
 class OrchestrationError(Exception):
@@ -63,6 +64,12 @@ class AgentOrchestrator:
 
         context: dict[str, Any] = {}
         triage_flags: list[str] = []
+        sanitized_subject, subject_flags = redact_pii(ticket.subject)
+        sanitized_body, body_flags = redact_pii(ticket.body)
+        if subject_flags or body_flags:
+            triage_flags.extend(subject_flags + body_flags)
+            ticket.subject = sanitized_subject
+            ticket.body = sanitized_body
         try:
             context = call("triage", "get_customer_context", customer_id=ticket.customer_id)
             triage = self.triage(ticket, context)
@@ -84,8 +91,16 @@ class AgentOrchestrator:
             return self._escalate(ticket, triage_run, "No specialist is available for this request")
         active_calls = []
         response, flags = self._run_specialist(agent, ticket, call)
+        omissions = validate_response_policy(response.customer_message)
+        if omissions:
+            flags.extend(omissions)
+            response.customer_message = "We need to review this response with a human support specialist."
+            response.escalation_reason = response.escalation_reason or "Response policy violation"
+        redacted_message, message_flags = redact_pii(response.customer_message)
+        response.customer_message = redacted_message
+        flags.extend(message_flags)
         run = AgentRun(ticket_id=ticket.id, agent_name=agent, trace_id=ticket.trace_id,
-                       output=response.model_dump(mode="json"), guardrail_flags=flags,
+                       output=response.model_dump(mode="json"), guardrail_flags=sorted(set(flags)),
                        tool_calls=active_calls)
         self.repository.save_agent_run(run)
         if response.escalation_reason or flags:
@@ -122,12 +137,17 @@ class AgentOrchestrator:
                 eligibility = call(agent, "check_refund_eligibility", order_id=f"order-{match.group(1)}")
                 if not eligibility["eligible"]:
                     return ResponseDraft(customer_message="This order is not eligible for a refund."), flags
+                if eligibility.get("amount", 0) > self.settings.refund_approval_threshold:
+                    flags.append("refund_above_threshold")
+                    return ResponseDraft(customer_message="Your refund request is above the automatic approval limit and requires human review.", escalation_reason="Refund requires approval"), flags
                 return ResponseDraft(customer_message="Your refund request is ready for review.", escalation_reason="Refund requires approval"), flags
             return ResponseDraft(customer_message="An account specialist will review this request.", escalation_reason="Account security action requires human review"), flags
         except BudgetExceeded:
             flags.append("budget_exhausted")
-        except ToolError:
+        except ToolError as error:
             flags.append("tool_failure")
+            if isinstance(error, ApprovalRequired):
+                flags.append("approval_required")
         return ResponseDraft(customer_message="We could not complete this request automatically.", escalation_reason="A support tool failed"), flags
 
     def _escalate(self, ticket: Ticket, run: AgentRun, reason: str) -> dict[str, Any]:

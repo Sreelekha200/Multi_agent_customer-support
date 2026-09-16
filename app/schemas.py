@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from uuid import UUID, uuid4
 
@@ -99,8 +99,12 @@ class AgentRun(BaseModel):
 class ApprovalRequest(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     agent_run_id: UUID
+    customer_id: str = Field(min_length=1, max_length=128)
+    action: str = Field(min_length=1, max_length=128)
     proposed_action: str = Field(min_length=1, max_length=2_000)
     risk_reason: str = Field(min_length=1, max_length=2_000)
     status: ApprovalStatus = ApprovalStatus.PENDING
     reviewer_id: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    expires_at: datetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(hours=24))
     schema_version: int = Field(default=1, ge=1)
