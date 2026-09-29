@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -92,6 +92,17 @@ class TicketRepository:
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     schema_version INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS escalation_queue (
+                    id TEXT PRIMARY KEY,
+                    ticket_id TEXT NOT NULL,
+                    agent_run_id TEXT,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    dead_letter TEXT,
+                    payload TEXT
                 );
                 CREATE TABLE IF NOT EXISTS customers (
                     id TEXT PRIMARY KEY,
@@ -254,7 +265,7 @@ class TicketRepository:
     def save_approval_request(self, request: ApprovalRequest) -> ApprovalRequest:
         with self._connect() as connection:
             connection.execute(
-                """INSERT INTO approval_requests
+                """INSERT OR REPLACE INTO approval_requests
                 (id, agent_run_id, customer_id, action, proposed_action, risk_reason, status, reviewer_id, created_at, expires_at, schema_version)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(request.id), str(request.agent_run_id), request.customer_id, request.action,
@@ -271,6 +282,70 @@ class TicketRepository:
             })
         return request
 
+    def save_escalation(self, ticket_id: UUID, agent_run_id: UUID | None, reason: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        from uuid import uuid4
+        escalation_id = str(uuid4())
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO escalation_queue (id, ticket_id, agent_run_id, reason, status, created_at, updated_at, dead_letter, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (escalation_id, str(ticket_id), str(agent_run_id) if agent_run_id else None, reason, "pending", now, now, None, json.dumps(payload or {})),
+            )
+        self.record_audit_event(ticket_id, "escalation_queued", {"escalation_id": escalation_id, "reason": reason})
+        return {"id": escalation_id, "status": "pending", "reason": reason}
+
+    def record_escalation(self, ticket_id: UUID, agent_run_id: UUID | None, reason: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.save_escalation(ticket_id, agent_run_id, reason, payload)
+
+    def get_escalation_queue(self, ticket_id: UUID | None = None) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            if ticket_id is None:
+                rows = connection.execute("SELECT * FROM escalation_queue ORDER BY created_at DESC").fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM escalation_queue WHERE ticket_id = ? ORDER BY created_at DESC", (str(ticket_id),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_dead_letter(self, ticket_id: UUID, reason: str) -> dict[str, Any]:
+        from uuid import uuid4
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM escalation_queue WHERE ticket_id = ? AND dead_letter IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                (str(ticket_id),),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            escalation_id = str(uuid4())
+            connection.execute(
+                "INSERT INTO escalation_queue (id, ticket_id, agent_run_id, reason, status, created_at, updated_at, dead_letter, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (escalation_id, str(ticket_id), None, reason, "dead_letter", now, now, reason, json.dumps({"reason": reason, "kind": "dead_letter"})),
+            )
+        self.record_audit_event(ticket_id, "dead_letter", {"reason": reason, "escalation_id": escalation_id})
+        return {"id": escalation_id, "status": "dead_letter", "reason": reason}
+
+    def get_dead_letter(self, ticket_id: UUID) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM escalation_queue WHERE ticket_id = ? AND status = 'dead_letter' ORDER BY created_at DESC LIMIT 1",
+                (str(ticket_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def retry_ticket(self, ticket_id: UUID, reason: str | None = None) -> dict[str, Any]:
+        self.update_ticket_status(ticket_id, TicketStatus.IN_PROGRESS)
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE escalation_queue SET status = 'retried', updated_at = ?, dead_letter = ?, payload = COALESCE(payload, '{}') WHERE ticket_id = ? AND status = 'pending'",
+                (now, reason or "retry_scheduled", str(ticket_id)),
+            )
+            retry_row = connection.execute(
+                "SELECT * FROM escalation_queue WHERE ticket_id = ? ORDER BY created_at DESC LIMIT 1",
+                (str(ticket_id),),
+            ).fetchone()
+        self.record_audit_event(ticket_id, "retry_scheduled", {"reason": reason or "retry_scheduled"})
+        return dict(retry_row) if retry_row else {"status": "in_progress"}
+
     def get_approval_request(self, request_id: UUID) -> ApprovalRequest | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -279,6 +354,37 @@ class TicketRepository:
         if not row:
             return None
         return ApprovalRequest.model_validate({**dict(row), "id": row["id"], "agent_run_id": row["agent_run_id"]})
+
+    def get_approval_request_obj(self, request_id: str | UUID) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM approval_requests WHERE id = ?", (str(request_id),)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_approval_requests_by_status(self, status: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM approval_requests WHERE status = ? ORDER BY created_at DESC", (status,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def is_approval_expired_by_id(self, request_id: str | UUID) -> bool:
+        request = self.get_approval_request_obj(request_id)
+        if request is None:
+            return True
+        expires_at = datetime.fromisoformat(request["expires_at"])
+        created_at = datetime.fromisoformat(request["created_at"])
+        return datetime.now(UTC) > expires_at or datetime.now(UTC) > created_at + timedelta(days=1)
+
+    def update_approval_request_status(self, request_id: str | UUID, status: ApprovalStatus, reviewer_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE approval_requests SET status = ?, reviewer_id = ? WHERE id = ?",
+                (status.value, reviewer_id, str(request_id)),
+            )
+        row = connection.execute("SELECT * FROM approval_requests WHERE id = ?", (str(request_id),)).fetchone()
+        return dict(row)
 
     def update_approval_request(
         self, request_id: UUID, status: ApprovalStatus, reviewer_id: str

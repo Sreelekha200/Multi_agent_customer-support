@@ -104,9 +104,33 @@ class AgentOrchestrator:
                        tool_calls=active_calls)
         self.repository.save_agent_run(run)
         if response.escalation_reason or flags:
-            return self._escalate(ticket, run, response.escalation_reason or "Specialist execution failed")
+            escalation = self._escalate(ticket, run, response.escalation_reason or "Specialist execution failed")
+            escalation["final_response"] = self._build_final_response(ticket, run, escalation["reason"], "escalated")
+            return escalation
         self.repository.update_ticket_status(ticket.id, TicketStatus.RESOLVED)
-        return {"status": TicketStatus.RESOLVED.value, "agent": agent, "response": response.model_dump(mode="json")}
+        final_response = self._build_final_response(ticket, run, None, "resolved", response)
+        return {"status": TicketStatus.RESOLVED.value, "agent": agent, "response": response.model_dump(mode="json"), "final_response": final_response}
+
+    def _build_final_response(self, ticket: Ticket, run: AgentRun, reason: str | None, status: str, response: ResponseDraft | None = None) -> dict[str, Any]:
+        customer_message = (response.customer_message if response else "A human support specialist is reviewing this ticket.")
+        payload: dict[str, Any] = {
+            "status": status,
+            "customer_message": customer_message,
+            "internal_notes": reason or "Ticket processed successfully.",
+            "proposed_action": None,
+            "escalation_reason": reason,
+        }
+        if response is not None and response.proposed_action is not None:
+            payload["proposed_action"] = response.proposed_action.model_dump(mode="json")
+        elif reason:
+            payload["proposed_action"] = {"name": "escalate_to_human", "arguments": {"ticket_id": str(ticket.id), "reason": reason}, "requires_approval": False}
+        return payload
+
+    def _escalate(self, ticket: Ticket, run: AgentRun, reason: str) -> dict[str, Any]:
+        self.repository.update_ticket_status(ticket.id, TicketStatus.ESCALATED)
+        self.repository.record_escalation(ticket.id, run.id, reason, self._build_final_response(ticket, run, reason, "escalated"))
+        self.repository.record_audit_event(ticket.id, "escalated", {"reason": reason, "agent_run_id": str(run.id)})
+        return {"status": TicketStatus.ESCALATED.value, "reason": reason, "agent_run_id": str(run.id), "final_response": self._build_final_response(ticket, run, reason, "escalated")}
 
     def _classify(self, ticket: Ticket, _: dict[str, Any]) -> TriageResult:
         text = f"{ticket.subject} {ticket.body}".lower()
@@ -150,7 +174,3 @@ class AgentOrchestrator:
                 flags.append("approval_required")
         return ResponseDraft(customer_message="We could not complete this request automatically.", escalation_reason="A support tool failed"), flags
 
-    def _escalate(self, ticket: Ticket, run: AgentRun, reason: str) -> dict[str, Any]:
-        self.repository.update_ticket_status(ticket.id, TicketStatus.ESCALATED)
-        self.repository.record_audit_event(ticket.id, "escalated", {"reason": reason, "agent_run_id": str(run.id)})
-        return {"status": TicketStatus.ESCALATED.value, "reason": reason, "agent_run_id": str(run.id)}

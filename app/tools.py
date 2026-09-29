@@ -3,6 +3,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -57,6 +58,8 @@ class ToolRegistry:
         if self.settings.app_env == "development":
             with self.repository._connect() as connection:
                 connection.execute("DELETE FROM rate_limit_events")
+                connection.execute("DELETE FROM refunds")
+                connection.execute("DELETE FROM escalation_queue")
         self.tools: dict[str, Callable[..., Any]] = {
             "get_customer_context": self.get_customer_context,
             "get_invoice": self.get_invoice,
@@ -107,7 +110,7 @@ class ToolRegistry:
 
     def create_approval_request(self, customer_id: str, agent_run_id: str, action: str, risk_reason: str) -> ApprovalRequest:
         request = ApprovalRequest(
-            agent_run_id=__import__('uuid').UUID(agent_run_id),
+            agent_run_id=UUID(agent_run_id),
             customer_id=customer_id,
             action=action,
             proposed_action=f"{action} for customer {customer_id}",
@@ -115,17 +118,17 @@ class ToolRegistry:
         )
         return self.repository.save_approval_request(request)
 
-    def get_approval_request(self, request_id: str | __import__('uuid').UUID) -> ApprovalRequest | None:
-        return self.repository.get_approval_request(__import__('uuid').UUID(str(request_id)))
+    def get_approval_request(self, request_id: str | UUID) -> ApprovalRequest | None:
+        return self.repository.get_approval_request(UUID(str(request_id)))
 
-    def approve_approval_request(self, request_id: str | __import__('uuid').UUID, reviewer_id: str) -> ApprovalRequest | None:
+    def approve_approval_request(self, request_id: str | UUID, reviewer_id: str) -> ApprovalRequest | None:
         request = self.get_approval_request(request_id)
         if request is None:
             return None
         self.repository.update_approval_request(request.id, ApprovalStatus.APPROVED, reviewer_id)
         return self.get_approval_request(request.id)
 
-    def reject_approval_request(self, request_id: str | __import__('uuid').UUID, reviewer_id: str) -> ApprovalRequest | None:
+    def reject_approval_request(self, request_id: str | UUID, reviewer_id: str) -> ApprovalRequest | None:
         request = self.get_approval_request(request_id)
         if request is None:
             return None
@@ -135,7 +138,7 @@ class ToolRegistry:
     def is_approval_expired(self, request: ApprovalRequest) -> bool:
         return datetime.now(UTC) > request.expires_at or datetime.now(UTC) > request.created_at + timedelta(days=1)
 
-    def _guardrail_response(self, ticket_id: object, name: str, decision: str, reason: str) -> None:
+    def _guardrail_response(self, ticket_id: UUID, name: str, decision: str, reason: str) -> None:
         self.repository.record_guardrail_event(ticket_id, name, decision, reason)
 
     def sanitize_ticket_for_agent(self, ticket: Ticket) -> tuple[Ticket, list[str]]:

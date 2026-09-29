@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check app scripts tests
+      - name: Format
+        run: ruff format --check app/observability.py scripts/run_evaluation.py scripts/demo.py tests
+      - name: Type check
+        run: mypy app scripts
+      - name: Unit and contract tests
+        run: pytest -q
+      - name: Evaluation threshold
+        run: python scripts/run_evaluation.py --min-pass-rate 1.0

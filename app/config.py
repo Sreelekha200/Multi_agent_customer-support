@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     max_agent_turns: int = Field(default=8, ge=1)
     max_execution_seconds: float = Field(default=10.0, gt=0)
     max_tool_retries: int = Field(default=1, ge=0)
+    otel_service_name: str = "multi-agent-customer-support"
+    otel_exporter_otlp_endpoint: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 

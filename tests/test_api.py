@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from app.guardrails import redact_pii, validate_response_policy
 from app.main import app, ticket_repository
 from app.orchestration import AgentOrchestrator
-from app.schemas import ApprovalStatus, Ticket, TicketCategory, TriageResult
+from app.schemas import ApprovalRequest, ApprovalStatus, Ticket, TicketCategory, TriageResult
 from app.tools import ApprovalRequired, NotFoundError, ToolError, ToolPermissionError, ToolRegistry
 
 client = TestClient(app)
@@ -17,6 +17,16 @@ def test_health() -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_ready_and_metrics_endpoints() -> None:
+    ready = client.get("/ready")
+    metrics = client.get("/metrics")
+
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+    assert metrics.status_code == 200
+    assert "metrics" in metrics.json()
 
 
 def test_ticket_ingestion_normalizes_ticket() -> None:
@@ -157,7 +167,12 @@ def test_tools_return_safe_failures_for_unknown_records_and_diagnostics() -> Non
 
 def test_orchestrator_routes_billing_and_records_tool_call() -> None:
     ticket = ticket_repository.save_ticket(
-        Ticket(customer_id="customer-123", channel="chat", subject="Plan question", body="What plan am I on?")
+        Ticket(
+            customer_id="customer-123",
+            channel="chat",
+            subject="Plan question",
+            body="What plan am I on?",
+        )
     )
 
     result = AgentOrchestrator(ticket_repository).process(ticket.id)
@@ -166,7 +181,8 @@ def test_orchestrator_routes_billing_and_records_tool_call() -> None:
     assert result["agent"] == "billing"
     with ticket_repository._connect() as connection:
         run = connection.execute(
-            "SELECT agent_name FROM agent_runs WHERE ticket_id = ? ORDER BY rowid DESC LIMIT 1", (str(ticket.id),)
+            "SELECT agent_name FROM agent_runs WHERE ticket_id = ? ORDER BY rowid DESC LIMIT 1",
+            (str(ticket.id),),
         ).fetchone()
         calls = connection.execute(
             "SELECT name FROM tool_calls WHERE agent_run_id = (SELECT id FROM agent_runs WHERE ticket_id = ? AND agent_name = 'billing' ORDER BY rowid DESC LIMIT 1)",
@@ -178,10 +194,17 @@ def test_orchestrator_routes_billing_and_records_tool_call() -> None:
 
 def test_orchestrator_escalates_low_confidence_without_specialist() -> None:
     ticket = ticket_repository.save_ticket(
-        Ticket(customer_id="customer-123", channel="email", subject="Hello", body="I have a question")
+        Ticket(
+            customer_id="customer-123", channel="email", subject="Hello", body="I have a question"
+        )
     )
-    triage = lambda _ticket, _context: TriageResult(category=TicketCategory.BILLING, urgency=1,
-                                                    sentiment="neutral", confidence=0.2, summary="ambiguous")
+    triage = lambda _ticket, _context: TriageResult(
+        category=TicketCategory.BILLING,
+        urgency=1,
+        sentiment="neutral",
+        confidence=0.2,
+        summary="ambiguous",
+    )
 
     result = AgentOrchestrator(ticket_repository, triage=triage).process(ticket.id)
 
@@ -224,7 +247,7 @@ def test_approval_requests_support_review_and_expiration() -> None:
         "customer-123",
         "11111111-1111-4111-8111-111111111111",
         "issue_refund",
-        "Large refund requires review"
+        "Large refund requires review",
     )
 
     assert approval.status == ApprovalStatus.PENDING
@@ -235,7 +258,143 @@ def test_approval_requests_support_review_and_expiration() -> None:
         "customer-123",
         "11111111-1111-4111-8111-111111111112",
         "change_email",
-        "Sensitive customer change"
+        "Sensitive customer change",
     )
     expired.created_at = expired.created_at.replace(year=expired.created_at.year - 1)
     assert registry.is_approval_expired(expired) is True
+
+
+def test_phase_six_escalation_returns_final_response_contract_and_queue_record() -> None:
+    ticket = ticket_repository.save_ticket(
+        Ticket(customer_id="customer-123", channel="email", subject="Hello", body="I need help")
+    )
+
+    result = AgentOrchestrator(
+        ticket_repository,
+        triage=lambda _ticket, _context: TriageResult(
+            category=TicketCategory.BILLING,
+            urgency=1,
+            sentiment="neutral",
+            confidence=0.2,
+            summary="ambiguous request",
+        ),
+    ).process(ticket.id)
+
+    assert result["status"] == "escalated"
+    assert "final_response" in result
+    assert result["final_response"]["status"] == "escalated"
+    assert result["final_response"]["escalation_reason"]
+    queue = ticket_repository.get_escalation_queue(ticket.id)
+    assert queue and queue[0]["status"] == "pending"
+
+
+def test_phase_six_retry_marks_ticket_in_progress_and_dead_letter_is_preserved() -> None:
+    ticket = ticket_repository.save_ticket(
+        Ticket(
+            customer_id="customer-123",
+            channel="chat",
+            subject="Retry me",
+            body="Please retry this ticket",
+        )
+    )
+
+    ticket_repository.record_dead_letter(ticket.id, "temporary tool outage")
+    ticket_repository.retry_ticket(ticket.id)
+
+    stored = ticket_repository.get_ticket(ticket.id)
+    assert stored["status"] == "in_progress"
+    assert ticket_repository.get_dead_letter(ticket.id) is not None
+
+
+def test_phase_seven_dashboard_lists_approvals_and_escalations() -> None:
+    ticket = ticket_repository.save_ticket(
+        Ticket(customer_id="customer-123", channel="web_form", subject="Refund", body="I need help")
+    )
+    request = ticket_repository.save_approval_request(
+        ApprovalRequest(
+            id=__import__("uuid").UUID("11111111-1111-4111-8111-111111111113"),
+            agent_run_id=__import__("uuid").UUID("11111111-1111-4111-8111-111111111114"),
+            customer_id="customer-123",
+            action="issue_refund",
+            proposed_action="Issue refund for order-100",
+            risk_reason="Refund exceeds threshold",
+            status=ApprovalStatus.PENDING,
+        )
+    )
+    ticket_repository.record_escalation(
+        ticket.id, request.agent_run_id, "Needs human review", {"status": "escalated"}
+    )
+
+    response = client.get("/dashboard", headers={"X-Reviewer-Id": "support-lead"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["pending_approvals"]
+    assert payload["escalated_tickets"]
+    assert payload["pending_approvals"][0]["customer_id"] == "customer-123"
+
+
+def test_phase_seven_approve_reject_are_permissioned_and_idempotent() -> None:
+    approval = ticket_repository.save_approval_request(
+        ApprovalRequest(
+            id=__import__("uuid").UUID("11111111-1111-4111-8111-111111111115"),
+            agent_run_id=__import__("uuid").UUID("11111111-1111-4111-8111-111111111116"),
+            customer_id="customer-123",
+            action="issue_refund",
+            proposed_action="Issue refund for order-100",
+            risk_reason="Large amount",
+            status=ApprovalStatus.PENDING,
+        )
+    )
+    denied = client.post(
+        f"/approvals/{approval.id}/approve",
+        json={"reviewer_id": "random-user", "confirm": True},
+        headers={"X-Reviewer-Id": "random-user"},
+    )
+    assert denied.status_code == 403
+
+    approved = client.post(
+        f"/approvals/{approval.id}/approve",
+        json={"reviewer_id": "support-lead", "confirm": True},
+        headers={"X-Reviewer-Id": "support-lead"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+
+    duplicate = client.post(
+        f"/approvals/{approval.id}/approve",
+        json={"reviewer_id": "support-lead", "confirm": True},
+        headers={"X-Reviewer-Id": "support-lead"},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["status"] == "approved"
+
+    rejected = client.post(
+        f"/approvals/{approval.id}/reject",
+        json={"reviewer_id": "support-lead"},
+        headers={"X-Reviewer-Id": "support-lead"},
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+
+
+def test_phase_seven_stale_requests_cannot_be_approved() -> None:
+    approval = ticket_repository.save_approval_request(
+        ApprovalRequest(
+            id=__import__("uuid").UUID("11111111-1111-4111-8111-111111111117"),
+            agent_run_id=__import__("uuid").UUID("11111111-1111-4111-8111-111111111118"),
+            customer_id="customer-456",
+            action="change_email",
+            proposed_action="Change email address",
+            risk_reason="Sensitive change",
+            status=ApprovalStatus.PENDING,
+            created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            - __import__("datetime").timedelta(days=3),
+        )
+    )
+    response = client.post(
+        f"/approvals/{approval.id}/approve",
+        json={"reviewer_id": "support-lead", "confirm": True},
+        headers={"X-Reviewer-Id": "support-lead"},
+    )
+    assert response.status_code == 409
+    assert "expired" in response.json()["detail"].lower()
